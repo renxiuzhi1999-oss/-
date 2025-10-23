@@ -1,7 +1,14 @@
-"""Comprehensive fMRI DDPM training and generation script.
+"""基于 DDPM 的 fMRI 训练与生成脚本。
 
-This module provides dataset handling, UNet backbone, diffusion processes,
-training utilities, and a CLI for training or generating conditioned samples.
+该脚本整合了以下核心功能：
+
+* 数据集加载：读取包含受试者人口学信息的 fMRI 体数据；
+* 模型结构：实现可接受条件输入的三维 UNet 主干；
+* 扩散过程：定义噪声调度器与 DDPM 前向、反向采样流程；
+* 训练与推理：封装训练循环与条件生成逻辑；
+* 命令行接口：提供训练与生成两种子命令便于快速调用。
+
+所有注释均使用中文，便于阅读与维护。
 """
 from __future__ import annotations
 
@@ -19,6 +26,7 @@ from torch.utils.data import DataLoader, Dataset
 
 
 # ---------------------------- Dataset utilities ---------------------------- #
+# 数据集与元数据相关的工具类与函数。
 
 @dataclass
 class SubjectMetadata:
@@ -29,6 +37,7 @@ class SubjectMetadata:
 
     @classmethod
     def from_record(cls, record: Dict[str, Any]) -> "SubjectMetadata":
+        """从元数据字典中解析出受试者结构化信息。"""
         return cls(
             subject_id=str(record.get("subject_id")),
             age=float(record.get("age")),
@@ -38,7 +47,7 @@ class SubjectMetadata:
 
 
 class FMRIExample(Dataset):
-    """Dataset wrapper for fMRI volumes with demographic conditioning."""
+    """基于人口学条件的 fMRI 体素数据集封装。"""
 
     def __init__(
         self,
@@ -53,7 +62,9 @@ class FMRIExample(Dataset):
         self.metadata_file = Path(metadata_file)
         self.volume_shape = volume_shape
         self.dtype = dtype
+        # 读取并缓存所有元数据记录，方便后续索引。
         self.records = self._load_metadata()
+        # 若未提供性别或标签映射，则依据元数据动态构建类别到索引的映射表。
         self.gender_map = gender_map or self._build_map("gender")
         self.label_map = label_map or self._build_map("label")
 
@@ -65,6 +76,7 @@ class FMRIExample(Dataset):
         return payload
 
     def _build_map(self, key: str) -> Dict[str, int]:
+        """根据指定键提取所有取值并构建到整数索引的映射。"""
         values = sorted({str(item.get(key)) for item in self.records})
         return {value: idx for idx, value in enumerate(values)}
 
@@ -73,11 +85,13 @@ class FMRIExample(Dataset):
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         record = self.records[index]
+        # 通过数据类将字典记录转换为结构化对象，便于后续访问属性。
         metadata = SubjectMetadata.from_record(record)
 
         path = self.data_dir / f"{metadata.subject_id}.npy"
         if not path.exists():
             raise FileNotFoundError(f"Volume file not found for subject {metadata.subject_id}")
+        # 加载体数据并执行归一化到 [0, 1]，同时添加通道维度。
         volume = np.load(path).astype(np.float32)
         volume = volume.reshape(self.volume_shape)
         volume = (volume - volume.min()) / (volume.max() - volume.min() + 1e-6)
@@ -85,6 +99,7 @@ class FMRIExample(Dataset):
 
         gender_idx = self.gender_map[metadata.gender]
         label_idx = self.label_map[metadata.label]
+        # 条件向量包含年龄、性别索引、自闭症标签索引，供扩散模型使用。
         cond = torch.tensor([metadata.age, gender_idx, label_idx], dtype=self.dtype)
 
         return {
@@ -98,6 +113,7 @@ class FMRIExample(Dataset):
 # ----------------------------- Diffusion utils ----------------------------- #
 
 class SinusoidalPositionEmbeddings(nn.Module):
+    """实现时间步位置编码，将标量时间映射到高维嵌入。"""
     def __init__(self, dim: int) -> None:
         super().__init__()
         self.dim = dim
@@ -115,6 +131,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
 
 
 class ResidualBlock(nn.Module):
+    """带条件与时间编码的残差卷积模块。"""
     def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int, cond_dim: int) -> None:
         super().__init__()
         self.time_mlp = nn.Sequential(
@@ -136,11 +153,13 @@ class ResidualBlock(nn.Module):
             nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
         )
         if in_channels != out_channels:
+            # 当输入输出通道数量不一致时，使用 1x1 卷积对残差进行调整。
             self.residual_conv = nn.Conv3d(in_channels, out_channels, kernel_size=1)
         else:
             self.residual_conv = nn.Identity()
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor, cond_emb: torch.Tensor) -> torch.Tensor:
+        # 主分支先执行归一化与卷积，再叠加时间与条件信息。
         h = self.block1(x)
         h = h + self.time_mlp(time_emb)[:, :, None, None, None]
         h = h + self.cond_mlp(cond_emb)[:, :, None, None, None]
@@ -149,6 +168,8 @@ class ResidualBlock(nn.Module):
 
 
 class UNet3D(nn.Module):
+    """可处理三维体数据的条件 UNet 主干。"""
+
     def __init__(self, channels: int, base_channels: int, channel_multipliers: Iterable[int], time_dim: int, cond_dim: int) -> None:
         super().__init__()
         self.init_conv = nn.Conv3d(1, base_channels, kernel_size=3, padding=1)
@@ -159,6 +180,7 @@ class UNet3D(nn.Module):
         self.cond_dim = cond_dim
         for mult in channel_multipliers:
             out_channels = base_channels * mult
+            # 每个下采样层包含两个残差块与一次步幅为 2 的卷积，用于降采样空间尺寸。
             downs.append(
                 nn.ModuleList(
                     [
@@ -173,6 +195,7 @@ class UNet3D(nn.Module):
 
         self.mid = nn.ModuleList(
             [
+                # 中间层主要提升感受野并融合全局信息。
                 ResidualBlock(in_channels, in_channels, time_dim, cond_dim),
                 ResidualBlock(in_channels, in_channels, time_dim, cond_dim),
             ]
@@ -181,6 +204,7 @@ class UNet3D(nn.Module):
         ups = []
         for mult in reversed(list(channel_multipliers)):
             out_channels = base_channels * mult
+            # 上采样阶段同时利用编码端的残差（skip connection）恢复细节。
             ups.append(
                 nn.ModuleList(
                     [
@@ -201,20 +225,24 @@ class UNet3D(nn.Module):
         self.time_embeddings = SinusoidalPositionEmbeddings(time_dim)
 
     def forward(self, x: torch.Tensor, time: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        # 将离散时间步编码到高维空间，供残差块融合。
         t_emb = self.time_embeddings(time)
         h = self.init_conv(x)
         residuals = []
         for block1, block2, downsample in self.downs:
+            # 编码阶段：逐层下采样并保存特征以便解码阶段融合。
             h = block1(h, t_emb, cond)
             h = block2(h, t_emb, cond)
             residuals.append(h)
             h = downsample(h)
 
         for block in self.mid:
+            # 中间层进一步融合时空特征。
             h = block(h, t_emb, cond)
 
         for block1, block2, upsample in self.ups:
             res = residuals.pop()
+            # 解码阶段：拼接对应的编码特征，实现 U 型结构信息流。
             h = torch.cat((h, res), dim=1)
             h = block1(h, t_emb, cond)
             h = block2(h, t_emb, cond)
@@ -224,6 +252,7 @@ class UNet3D(nn.Module):
 
 
 class LinearNoiseScheduler:
+    """线性噪声调度器，决定每个时间步的噪声强度。"""
     def __init__(self, num_train_timesteps: int, beta_start: float = 1e-4, beta_end: float = 2e-2) -> None:
         self.num_train_timesteps = num_train_timesteps
         self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps)
@@ -231,6 +260,7 @@ class LinearNoiseScheduler:
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
 
     def add_noise(self, original_samples: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        # 根据当前时间步对输入样本注入噪声，得到扩散过程中的中间状态。
         sqrt_alpha_prod = self.alphas_cumprod[timesteps].sqrt().to(original_samples.device)
         sqrt_one_minus_alpha_prod = (1 - self.alphas_cumprod[timesteps]).sqrt().to(original_samples.device)
         while len(sqrt_alpha_prod.shape) < len(original_samples.shape):
@@ -242,6 +272,7 @@ class LinearNoiseScheduler:
 # ----------------------------- Training helpers --------------------------- #
 
 class DDPMTrainer:
+    """封装 DDPM 模型的训练与采样逻辑。"""
     def __init__(
         self,
         model: nn.Module,
@@ -256,6 +287,7 @@ class DDPMTrainer:
         self.criterion = nn.MSELoss()
 
     def _condition_embedding(self, conditioning: torch.Tensor) -> torch.Tensor:
+        """对条件向量执行标准化，使不同维度具有相近尺度。"""
         cond_mean = conditioning.mean(dim=0, keepdim=True)
         cond_std = conditioning.std(dim=0, keepdim=True) + 1e-6
         return (conditioning - cond_mean) / cond_std
@@ -268,6 +300,7 @@ class DDPMTrainer:
             conditioning = batch["conditioning"].to(self.device)
             cond_emb = self._condition_embedding(conditioning)
 
+            # 随机采样时间步，确保模型学习到不同噪声等级的去噪能力。
             timesteps = torch.randint(0, self.noise_scheduler.num_train_timesteps, (volumes.size(0),), device=self.device).long()
             noise = torch.randn_like(volumes)
             noisy_volumes = self.noise_scheduler.add_noise(volumes, noise, timesteps)
@@ -293,6 +326,7 @@ class DDPMTrainer:
     ) -> torch.Tensor:
         self.model.eval()
         cond_emb = self._condition_embedding(base_conditioning)
+        # 假设性别采用二值编码，通过 1-idx 得到相反性别并重新标准化。
         opposite_gender = 1 - gender_index  # assumes binary genders encoded as 0/1
         cond_emb[:, 1] = (opposite_gender - cond_emb[:, 1].mean()) / (cond_emb[:, 1].std() + 1e-6)
 
@@ -304,8 +338,10 @@ class DDPMTrainer:
             beta = self.noise_scheduler.betas[timestep].to(device)
             alpha = self.noise_scheduler.alphas[timestep].to(device)
             alpha_cum = self.noise_scheduler.alphas_cumprod[timestep].to(device)
+            # 依据 DDPM 推导公式执行一次逆扩散步。
             samples = (1 / alpha.sqrt()) * (samples - (beta / (1 - alpha_cum).sqrt()) * noise_pred)
             if timestep > 0:
+                # 当不是最后一步时，注入噪声以保持多样性。
                 samples = samples + beta.sqrt() * torch.randn_like(samples)
         return samples.clamp(-1, 1)
 
@@ -325,6 +361,7 @@ class TrainConfig:
 
 
 def create_dataloader(config: TrainConfig) -> Tuple[DataLoader, FMRIExample]:
+    """根据训练配置构建数据加载器与数据集实例。"""
     dataset = FMRIExample(
         data_dir=config.data_dir,
         metadata_file=config.metadata_path,
@@ -335,6 +372,7 @@ def create_dataloader(config: TrainConfig) -> Tuple[DataLoader, FMRIExample]:
 
 
 def train(config: TrainConfig) -> None:
+    """执行完整的模型训练流程并定期保存检查点。"""
     dataloader, dataset = create_dataloader(config)
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
 
@@ -349,6 +387,7 @@ def train(config: TrainConfig) -> None:
     trainer = DDPMTrainer(model, noise_scheduler, learning_rate=config.learning_rate, device=device)
 
     for epoch in range(1, config.epochs + 1):
+        # 逐轮训练并记录损失，方便观察模型收敛情况。
         loss = trainer.train_epoch(dataloader)
         print(f"Epoch {epoch}: loss={loss:.4f}")
         torch.save({
@@ -369,7 +408,8 @@ def generate(
     volume_shape: Tuple[int, int, int],
     timesteps: int,
     device: str,
-) -> None:
+    ) -> None:
+    """加载检查点并针对指定受试者生成相反性别的 fMRI 体数据。"""
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model = UNet3D(
         channels=1,
@@ -398,7 +438,7 @@ def generate(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train or run the fMRI DDPM generator")
+    parser = argparse.ArgumentParser(description="训练或执行条件 fMRI DDPM 生成器")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     train_parser = subparsers.add_parser("train")
@@ -424,6 +464,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """命令行入口，依据子命令分派训练或生成流程。"""
     args = parse_args()
     if args.command == "train":
         config = TrainConfig(
